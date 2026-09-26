@@ -788,23 +788,32 @@ def grow_up(group_id: str, user_id: str, skill_name: str, skill_value: int = Non
     """
     update_skill_value = False
     chara_id = get_current_character_id(group_id, user_id)
-    
+
+    if not (skill_name or "").strip():
+        return get_output("pc.grow.usage")
+
     if not chara_id and skill_value is None:
         return get_output("pc.grow.no_active")
 
+    chara_data = None
+    if chara_id:
+        chara_data = load_character(group_id, user_id, chara_id)
+
     # 如果未提供 skill_value，则从当前绑定的卡读取
     if skill_value is None:
+        # 未存过的技能不再按 COC 默认值 0 静默成长并写卡
+        attrs = (chara_data or {}).get("attributes", {})
+        canonical = COC_DEFAULT_SKILL_ALIASES.get((skill_name or "").strip(), (skill_name or "").strip())
+        if skill_name.strip() not in attrs and canonical not in attrs:
+            return get_output("pc.grow.no_skill", skill_name=skill_name)
         skill_value = get_skill_value(group_id, user_id, skill_name)
         update_skill_value = True
-    
-    if chara_id :
-        chara_data = load_character(group_id, user_id, chara_id)
 
     # 校验 skill_value 是否为整数
     try:
         skill_value = int(skill_value)
     except (ValueError, TypeError):
-        return get_output("pc.show.attr_missing", skill_name=skill_name)
+        return get_output("pc.show.attr_missing", attribute=skill_name)
 
     # 掷骰 (1D100)
     roll_result = random.randint(1, 100)

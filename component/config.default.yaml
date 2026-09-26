@@ -61,6 +61,7 @@ output:
     proxy_name: "{name}（由 <{operator}> 代投）"
     hidden:
       sent: "已进行暗中检定，结果已通过私聊发送。"
+      unsupported: "当前平台暂不支持暗骰（无法私聊发送结果），请直接使用明骰。"
 
   versus:
     no_winner: "双方均失败，无胜者"
@@ -170,6 +171,7 @@ output:
       # 火球术伤害
       {ring} 环火球术伤害：{breakdown} = {total}
     low: "火球术伤害结果"
+    too_high: "火球术环数过高结果"
 
   # ---------- COC判定 ----------
   coc_roll:
@@ -186,6 +188,8 @@ output:
 
   # ---------- 人格卡操作 ----------
   pc:
+    st:
+      usage: "属性记录用法"
     create:
       duplicate: "人物卡创建结果 {name}"
       success: "人物卡创建结果 {name} {id}"
@@ -239,6 +243,8 @@ output:
       success: "成长检定结果 {skill_name} {en_value} {new_value}"
       failure: "成长检定结果 {skill_name}"
       boost_result: "成长检定结果 {roll_result} {skill_value} {result}"
+      usage: "成长检定用法"
+      no_skill: "成长检定无技能 {skill_name}"
     export :
       success: "人物卡操作结果 {name} {data}"
     uni :
@@ -284,8 +290,17 @@ output:
     no_character: "群昵称同步结果 {id}"
     success: "群昵称同步结果"
 
+  nn:
+    set: "骰子昵称设置结果 {name}"
+    random: "骰子昵称随机结果 {name}"
+    current: "骰子昵称查看结果 {name}"
+    current_none: "骰子昵称查看结果"
+    cleared: "骰子昵称清除结果"
+    too_long: "骰子昵称过长 {limit}"
+
   # ---------- 掷骰 ----------
   dice:
+    unknown_command: "未知指令。用 .bothelp 查看全部指令。"
     normal:
       success: |
         掷骰结果
@@ -315,6 +330,7 @@ output:
 
   # ---------- SAN 理智 ----------
   san:
+    usage: "SAN 指令用法"
     result:
       success: "SAN 指令结果"
       failure: "SAN 指令结果"

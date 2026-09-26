@@ -105,7 +105,8 @@ def get_temporary_insanity(phobias: dict, manias: dict):
     """
     temporary_insanity = {i: get_output(f"san.temporary.{i}") for i in range(1, 11)}
     roll = random.randint(1, 10)
-    result = temporary_insanity[roll].replace("1D10", str(random.randint(1, 10)))
+    # 用负向断言避免把症状文本里的 "1D100" 误替换成 "1D10" 的结果+"0"
+    result = re.sub(r"1D10(?!0)", str(random.randint(1, 10)), temporary_insanity[roll])
     if roll == 9:
         fear_roll = random.randint(1, 100)
         result += "\n" + get_output("san.specific_phobia", phobia=phobias[str(fear_roll)], roll=fear_roll)
@@ -121,7 +122,8 @@ def get_long_term_insanity(phobias: dict, manias: dict):
     """
     long_term_insanity = {i: get_output(f"san.long_term.{i}") for i in range(1, 11)}
     roll = random.randint(1, 10)
-    result = long_term_insanity[roll].replace("1D10", str(random.randint(1, 10)))
+    # 同上:保护 "1D100" 不被 "1D10" 的替换波及
+    result = re.sub(r"1D10(?!0)", str(random.randint(1, 10)), long_term_insanity[roll])
     if roll == 9:
         fear_roll = random.randint(1, 100)
         result += "\n" + get_output("san.specific_phobia", phobia=phobias[str(fear_roll)], roll=fear_roll)

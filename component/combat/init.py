@@ -95,6 +95,15 @@ class InitiativeManager:
         if not expr:
             return random.randint(1, 20), default_name
 
+        # 骰式先攻(".ri 1d20"/".ri 2d6+3"):文档承诺的形态,此前被当成"值1名字d20"
+        dice_match = re.match(r"^(\d*)d(\d+)([+-]\d+)?$", expr.strip(), re.IGNORECASE)
+        if dice_match:
+            count = int(dice_match.group(1) or 1)
+            faces = int(dice_match.group(2))
+            modifier = int(dice_match.group(3) or 0)
+            init_value = sum(random.randint(1, faces) for _ in range(count)) + modifier
+            return init_value, default_name
+
         if expr[0] == "+":
             match = re.match(r"\+(\d+)", expr)
             return random.randint(1, 20) + int(match.group(1)), default_name

@@ -85,8 +85,11 @@ def prepare_skill_check(skill_name: str, skill_value: int) -> tuple[str, int]:
     if modifier:
         labels.append(f"{modifier:+d}")
     display_name = clean_name
+    if not display_name:
+        # 纯难度检定(如 ".ra困难60"):没有技能名,显示基础值而不是空名字
+        display_name = str(skill_value)
     if labels:
-        display_name = f"{clean_name}({', '.join(labels)})"
+        display_name = f"{clean_name}({', '.join(labels)})" if clean_name else f"({', '.join(labels)}){display_name}"
     return display_name, target_value
 
 

@@ -149,17 +149,25 @@ def parse_inline_command(message: str) -> Optional[ParsedInlineCommand]:
 
     elif cmd[0:2] == "rd":
         raw = message[2:].strip()
-        dice_match = re.match(r"(\d+)", raw)
-        if dice_match:
-            dice_size = dice_match.group(1)
-            expr = f"1d{dice_size}"
-            remark = raw[len(dice_size):].strip()
+        # 完整骰式(".rd 1d100 试骰" 粘连成 "rd1d100试骰"):先吃整个 XdY,
+        # 否则旧逻辑会把 "1d100" 拆成骰面 1 + 备注 "d100试骰",变成掷 1d1
+        expr_match = re.match(r"(\d*d\d+)", raw, re.IGNORECASE)
+        if expr_match:
+            expr = expr_match.group(1)
+            remark = raw[len(expr):].strip() or None
         else:
-            expr = "1d100"
-            remark = raw.strip()
+            dice_match = re.match(r"(\d+)", raw)
+            if dice_match:
+                dice_size = dice_match.group(1)
+                expr = f"1d{dice_size}"
+                remark = raw[len(dice_size):].strip()
+            else:
+                expr = "1d100"
+                remark = raw.strip()
         cmd = "rd"
 
-    elif cmd[0] == "r":
+    elif cmd[0] == "r" and cmd != "rv":
+        # rv(吸血鬼骰)注册在指令系统,放行给桥接;这里吞掉会让它永远变成 .r
         is_hidden_roll = cmd == "rh"
         command_len = 2 if is_hidden_roll else 1
         content = message[command_len:].strip()

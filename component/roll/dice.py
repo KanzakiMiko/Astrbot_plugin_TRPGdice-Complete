@@ -561,6 +561,9 @@ def fireball(ring: int = 3):
     """
     if ring < 3:
         return get_output("fireball.low")
+    if ring > 9:
+        # D&D5e 最高 9 现法术位,之前 20 环也会照常结算
+        return get_output("fireball.too_high")
     rolls = [random.randint(1, 6) for _ in range(8 + (ring - 3))]
     total_sum = sum(rolls)
     damage_breakdown = " + ".join(map(str, rolls))

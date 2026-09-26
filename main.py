@@ -14,6 +14,7 @@ import os
 import json
 import sys
 import html
+import inspect
 from pathlib import Path
 from playwright.async_api import Error as PlaywrightError, async_playwright
 
@@ -27,7 +28,7 @@ from .component.coc.rules import modify_coc_great_sf_rule_command
 from .component.coc.checks import parse_difficulty_prefix, parse_versus_check, prepare_skill_check, split_skill_modifier
 from .component.logs.store import JSONLoggerCore
 from .component.combat.init import InitiativeItem, InitiativeManager
-from .component.roll.parser import parse_inline_command, strip_command_prefix
+from .component.roll.parser import parse_inline_command, strip_command_prefix, ParsedInlineCommand
 from .component.pc.view import (
     clean_st_show_words,
     format_all_attributes,
@@ -48,7 +49,12 @@ COMMANDS = [
     "show",
     "del",
     "clr",
-    "export"
+    "clear",
+    "export",
+    "template",
+    "模板",
+    "帮助",
+    "help",
 ]
 
 log_help_str = '''.log 指令一览：
@@ -58,15 +64,22 @@ log_help_str = '''.log 指令一览：
 '''
 
 async def get_sender_nickname(client, group_id, sender_id) :
-    payloads = {
-        "group_id": group_id,
-        "user_id": sender_id,
-        "no_cache": True
-    }
-    
-    ret = await client.api.call_action("get_group_member_info", **payloads)
-    
-    return ret["card"]
+    # 非 QQ 平台(如飞书)没有 OneBot 的 get_group_member_info,退回空串,
+    # 由调用方回退到 event.get_sender_name()
+    if client is None or group_id is None:
+        return ""
+    try:
+        payloads = {
+            "group_id": group_id,
+            "user_id": sender_id,
+            "no_cache": True
+        }
+
+        ret = await client.api.call_action("get_group_member_info", **payloads)
+
+        return ret["card"] or ""
+    except Exception:
+        return ""
 
 async def init():
     await logger_core.initialize()
@@ -87,7 +100,7 @@ class DicePlugin(Star):
         if not group_id:
             return
         source_user_id = event.get_sender_id() if event else None
-        source_nickname = event.get_sender_name() if event else ""
+        source_nickname = await self._resolve_display_name(event) if event else ""
 
         ok, info = await logger_core.add_message(
             group_id=group_id,
@@ -100,6 +113,42 @@ class DicePlugin(Star):
             source_nickname=source_nickname
         )
 
+    async def _send_dice_result(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        target_user_id: str = None,
+        private: bool = False,
+    ):
+        """发送骰子结果。
+
+        QQ(aiocqhttp) 平台沿用原生 OneBot API,保留引用+@ 的排版;
+        其他平台(飞书等)退回 AstrBot 跨平台消息链,仅发纯文本。
+        """
+        client = event.bot
+        if client is None or event.get_platform_name() != "aiocqhttp":
+            await event.send(event.make_result().message(text))
+            return
+
+        if private:
+            payloads = {
+                "user_id": target_user_id or event.get_sender_id(),
+                "message": [{"type": "text", "data": {"text": text}}],
+            }
+            await client.api.call_action("send_private_msg", **payloads)
+            return
+
+        message_id = event.message_obj.message_id
+        payloads = {
+            "group_id": event.get_group_id(),
+            "message": [
+                {"type": "reply", "data": {"id": message_id}},
+                {"type": "at", "data": {"qq": target_user_id or event.get_sender_id()}},
+                {"type": "text", "data": {"text": "\n" + text}},
+            ],
+        }
+        await client.api.call_action("send_group_msg", **payloads)
+
     def _event_context_id(self, event: AstrMessageEvent) -> str:
         group_id = event.get_group_id()
         if group_id:
@@ -108,16 +157,134 @@ class DicePlugin(Star):
         return str(session_id or event.get_sender_id())
 
     async def _event_display_name(self, event: AstrMessageEvent, user_id: str = None) -> str:
-        user_id = user_id or event.get_sender_id()
+        return await self._resolve_display_name(event, user_id)
+
+    # ----------------- 海豹骰式 .nn 昵称 -----------------
+    NN_CLEAR_WORDS = {"clr", "clear", "清空", "清除", "reset"}
+    NN_MAX_LEN = 32
+    NN_RANDOM_PAIRS = [
+        ("爱喝奶茶的", ["小海豹", "月光龙", "小狐狸", "云朵", "猫猫", "小骰子"]),
+        ("打瞌睡的", ["守秘人", "调查员", "团子", "小雪人"]),
+        ("爱做梦的", ["梦境旅人", "小狐狸", "白鸽", "萤火虫"]),
+        ("看星星的", ["猫猫", "月光龙", "拾荒者", "雾中灯塔"]),
+        ("数羊的", ["小海豹", "团子", "睡眠不足的调查员"]),
+        ("追风的", ["风铃", "小骰子", "信使"]),
+        ("偷藏糖果的", ["魔女", "猫猫", "食尸鬼"]),
+        ("沉迷跑团的", ["KP", "骰奴", "规则书"]),
+        ("骰运爆棚的", ["百面骰", "幸运星", "天命者"]),
+        ("幸运E的", ["枪兵", "调查员", "旧日支配者的小邻居"]),
+    ]
+    NN_RANDOM_STANDALONE = [
+        "午夜调查员", "雾中灯塔", "守秘人的猫", "百面骰之主", "梦之行者",
+        "星之彩收藏家", "茶会常客", "旧印持有者", "迷途魅影", "星间漂流者",
+    ]
+
+    def _nn_scope_key(self, event: AstrMessageEvent) -> str:
+        """nn 昵称作用域：群聊按群隔离，私聊按用户。"""
+        group_id = event.get_group_id()
+        return str(group_id) if group_id else f"private:{event.get_sender_id()}"
+
+    def _get_user_nn(self, event: AstrMessageEvent, user_id) -> str:
+        store = self._load_settings("nicknames", self._nn_scope_key(event))
+        return str(store.get(str(user_id), "") or "")
+
+    def _save_user_nn(self, event: AstrMessageEvent, user_id, name: str):
+        store = self._load_settings("nicknames", self._nn_scope_key(event))
+        if name:
+            store[str(user_id)] = name
+        else:
+            store.pop(str(user_id), None)
+        self._save_settings("nicknames", self._nn_scope_key(event), store)
+
+    async def _resolve_display_name(self, event: AstrMessageEvent, user_id: str = None) -> str:
+        """统一显示名解析：.nn 昵称 > QQ 群名片 > 平台名（适配器侧保证不回退真实姓名）> 用户 ID"""
+        user_id = str(user_id or event.get_sender_id())
+        try:
+            nn = self._get_user_nn(event, user_id)
+            if nn:
+                return nn
+        except Exception:
+            pass
         group_id = event.get_group_id()
         if group_id:
             try:
-                nickname = await get_sender_nickname(event.bot, group_id, user_id)
-                if nickname:
-                    return nickname
+                card = await get_sender_nickname(event.bot, group_id, user_id)
+                if card:
+                    return card
             except Exception:
                 pass
-        return event.get_sender_name() if user_id == event.get_sender_id() else str(user_id)
+        if user_id == str(event.get_sender_id()):
+            return event.get_sender_name() or user_id
+        return user_id
+
+    # 内联分发器亲自处理的指令(其余点指令交给桥接)
+    _INLINE_CMDS = {
+        "r", "rd", "rh", "rab", "rap", "rau", "ra", "rc", "rah", "rch",
+        "rav", "rcv", "en", "sc", "li", "ti", "ri", "coc", "dnd", "find",
+        "nn", "setcoc", "set",
+    }
+    # 这些指令的参数依赖空格分词,剥空格的 legacy 解析会破坏它们
+    # (".nn show"→"nnshow"、".find 火球术 2014"→"find火球术2014" 等)
+    _SPACE_AWARE_CMDS = {"nn", "ri", "find", "sc", "coc", "dnd", "rav", "rcv"}
+
+    @staticmethod
+    def _maybe_reroute_with_spaces(parsed, raw_command: str):
+        """strip_command_prefix 会剥掉指令内部全部空格,当原文首词本身就是
+        内联指令名且带参数时,用未剥空格的原文重新解析,保住参数里的空格。"""
+        parts = (raw_command or "").split(None, 1)
+        if len(parts) != 2:
+            return parsed
+        first = parts[0].lower()
+        if first not in DicePlugin._SPACE_AWARE_CMDS:
+            return parsed
+        # legacy 已正确识别且非 find(find 的参数本身可能含空格)时不重路由
+        if parsed.cmd == first and first != "find":
+            return parsed
+        return ParsedInlineCommand(cmd=first, expr=parts[1].strip())
+
+    async def _handle_nn(self, event: AstrMessageEvent, raw_command: str):
+        """海豹骰式昵称：.nn 随机起名 / .nn 名字 设置 / .nn show 查看 / .nn clr 清除"""
+        user_id = str(event.get_sender_id())
+        m = re.match(r"^nn\s*(.*)$", (raw_command or "").strip(), re.IGNORECASE)
+        arg = m.group(1).strip() if m else ""
+
+        if arg.lower() in self.NN_CLEAR_WORDS:
+            self._save_user_nn(event, user_id, "")
+            yield event.plain_result(get_output("nn.cleared"))
+            return
+        if arg.lower() == "show":
+            current = self._get_user_nn(event, user_id)
+            if current:
+                yield event.plain_result(get_output("nn.current", name=current))
+            else:
+                yield event.plain_result(get_output("nn.current_none"))
+            return
+        if not arg:
+            if random.random() < 0.5:
+                adj, nouns = random.choice(self.NN_RANDOM_PAIRS)
+                arg = adj + random.choice(nouns)
+            else:
+                arg = random.choice(self.NN_RANDOM_STANDALONE)
+            self._save_user_nn(event, user_id, arg)
+            yield event.plain_result(get_output("nn.random", name=arg))
+            return
+        if len(arg) > self.NN_MAX_LEN:
+            yield event.plain_result(get_output("nn.too_long", limit=self.NN_MAX_LEN))
+            return
+        self._save_user_nn(event, user_id, arg)
+        yield event.plain_result(get_output("nn.set", name=arg))
+
+    async def _handle_setcoc(self, event: AstrMessageEvent, cmd: str, expr):
+        """CoC 大成功/大失败规则切换:.setcoc N,兼容 Dice! 用户习惯的 ".set coc N" 空格写法。
+
+        arg 为空时 modify_coc_great_sf_rule_command 返回帮助+当前规则。
+        """
+        if not self._command_enabled(event):
+            return
+        arg = str(expr or "").strip()
+        if cmd == "set":
+            arg = arg[3:].strip()  # ".set coc 2" 的 expr 是 "coc 2"
+        yield event.plain_result(modify_coc_great_sf_rule_command(event.get_group_id(), arg or " "))
 
     def _get_target_user_id(self, event: AstrMessageEvent) -> str:
         target_user_id = str(event.get_sender_id())
@@ -230,24 +397,14 @@ class DicePlugin(Star):
         group_id = event.get_group_id()
         client = event.bot
         
-        ret = await get_sender_nickname(client, group_id, user_id)
-        ret = event.get_sender_name() if ret == "" else ret
+        ret = await self._resolve_display_name(event, user_id)
 
         # 让 dice 模块处理表达式并返回由 get_output 格式化好的文本（或错误文本）
         result_text = dice_mod.handle_roll_dice(message if message else f"1d{dice_mod.DEFAULT_DICE}", name = ret, remark = remark)
-        message_id = event.message_obj.message_id
-        payloads = {
-            "group_id": group_id,
-            "message": [
-                {"type": "reply", "data": {"id": message_id}},
-                {"type": "at", "data": {"qq": user_id}},
-                {"type": "text", "data": {"text": "\n" + result_text}}
-            ]
-        }
-        
+
         await self.save_log(group_id = event.get_group_id(), content = result_text, event=event)
-        
-        await client.api.call_action("send_group_msg", **payloads)
+
+        await self._send_dice_result(event, result_text, target_user_id=user_id)
 
     @filter.command("rv")
     async def roll_dice_vampire(self, event: AstrMessageEvent, dice_count: str = "1", difficulty: str = "6"):
@@ -269,26 +426,19 @@ class DicePlugin(Star):
         group_id = event.get_group_id()
         client = event.bot
 
-        ret = await get_sender_nickname(client, group_id, user_id)
-        ret = event.get_sender_name() if ret == "" else ret
+        ret = await self._resolve_display_name(event, user_id)
         text = get_output("dice.vampire.success", result=result_body, name = ret)
-        
-        message_id = event.message_obj.message_id
-        payloads = {
-            "group_id": group_id,
-            "message": [
-                {"type": "reply", "data": {"id": message_id}},
-                {"type": "at", "data": {"qq": user_id}},
-                {"type": "text", "data": {"text": "\n" + text}}
-            ]
-        }
 
         await self.save_log(group_id = event.get_group_id(), content = text, event=event)
-        
-        await client.api.call_action("send_group_msg", **payloads)
+
+        await self._send_dice_result(event, text, target_user_id=user_id)
             
     async def roll_hidden(self, event: AstrMessageEvent, message: str = None):
         """私聊发送掷骰结果 —— 所有文本由 get_output 管理（无 fallback）"""
+        if event.get_platform_name() != "aiocqhttp":
+            # 非 QQ 平台无法私聊发送结果,直接回群会泄露暗骰结果,拒绝执行
+            yield event.plain_result(get_output("dice.hidden.unsupported"))
+            return
         sender_id = event.get_sender_id()
         message = message.strip() if message else f"1d{dice_mod.DEFAULT_DICE}"
 
@@ -297,23 +447,9 @@ class DicePlugin(Star):
 
         private_text = dice_mod.roll_hidden(message)
 
-        # 3) 发送私聊（使用平台 API）
-        client = event.bot
-        payloads = {
-            "user_id": sender_id,
-            "message": [
-                {
-                    "type": "text",
-                    "data": {
-                        "text": private_text
-                    }
-                }
-            ]
-        }
-        
         await self.save_log(group_id = event.get_group_id(), content = "[Private Roll Result]" + private_text, event=event)
-        
-        await client.api.call_action("send_private_msg", **payloads)
+
+        await self._send_dice_result(event, private_text, target_user_id=sender_id, private=True)
 
 
     @filter.command("st")
@@ -322,6 +458,8 @@ class DicePlugin(Star):
         if not self._command_enabled(event):
             return
         if not attributes:
+            # 裸 .st 以前静默(经桥接时被误报"没听懂"),现在回用法
+            yield event.plain_result(get_output("pc.st.usage"))
             return
 
         if attributes in COMMANDS :
@@ -342,6 +480,15 @@ class DicePlugin(Star):
         chara_data = charmod.load_character(group_id, user_id, chara_id)
         full_expr = self._strip_at_text((str(attributes) if attributes else "") + (str(exp) if exp else ""))
         attributes_clean = re.sub(r'\s+', '', full_expr)
+
+        # 等号赋值写法(".st 力量=65")等价于直接赋值;等号带非法尾巴则明确报错,
+        # 不再让旧正则静默丢弃 "=65" 并把属性清零
+        eq_match = re.fullmatch(r"([一-龥a-zA-Z/]+)=((?:\d+d)?\d+)", attributes_clean, re.IGNORECASE)
+        if eq_match:
+            attributes_clean = eq_match.group(1) + eq_match.group(2)
+        elif "=" in attributes_clean:
+            yield event.plain_result(get_output("pc.update.error_format"))
+            return
 
         # --- 
         # ⬇️ 多重赋值逻辑 ⬇️
@@ -399,14 +546,20 @@ class DicePlugin(Star):
         # ⬇️ 旧的单一属性逻辑 (现在也会处理 .st 力量100) ⬇️
         # ---
         
-        match = re.match(r"([\u4e00-\u9fa5a-zA-Z]+)\s*([+\-*]?)\s*(\d+(?:d\d+)?|\d*)", attributes_clean)
-        if not match:
+        match = re.match(r"([\u4e00-\u9fa5a-zA-Z]+)\s*([+\-*]?)\s*((?:\d+d)?\d+)?", attributes_clean)
+        if not match or match.end() != len(attributes_clean):
+            # \u4e0d\u518d\u5bb9\u5fcd\u5783\u573e\u5c3e\u5df4(".st san 60abc" \u66fe\u88ab\u9759\u9ed8\u622a\u65ad\u6210 san=60)
             yield event.plain_result(get_output("pc.update.error_format"))
             return
 
         attribute = match.group(1)
         operator = match.group(2) if match.group(2) else None
         value_expr = match.group(3) if match.group(3) else None
+
+        if not value_expr and not operator:
+            # \u88f8\u8bcd\u6ca1\u6709\u503c(".st \u5e78\u8fd0"):\u4e0d\u518d\u9759\u9ed8\u628a\u5c5e\u6027\u5199\u6210 0
+            yield event.plain_result(get_output("pc.update.error_format"))
+            return
 
         derived_tips = None
 
@@ -730,8 +883,7 @@ class DicePlugin(Star):
         user_id = event.get_sender_id()
         client = event.bot
         group_id = event.get_group_id()
-        ret = await get_sender_nickname(client, group_id, user_id)
-        ret = event.get_sender_name() if ret == "" else ret
+        ret = await self._resolve_display_name(event, user_id)
         
         chara_id = charmod.get_current_character_id(group_id, user_id)
         
@@ -838,29 +990,17 @@ class DicePlugin(Star):
         client = event.bot
         
         # 1. 环境准备：获取昵称和角色数据
-        nickname = await get_sender_nickname(client, group_id, user_id)
-        nickname = event.get_sender_name() if nickname == "" else nickname
+        nickname = await self._resolve_display_name(event, user_id)
         
         chara_data = charmod.get_current_character(group_id, user_id)
         
         # 2. 调用后端获取结果文本
         full_args = (str(arg1) + str(arg2)).lower().strip()
         result_text = dice_mod.handle_pistol_fire(full_args, name=nickname, chara_data=chara_data)
-        
-        # 3. 构造复合消息 payloads
-        message_id = event.message_obj.message_id
-        payloads = {
-            "group_id": group_id,
-            "message": [
-                {"type": "reply", "data": {"id": message_id}},
-                {"type": "at", "data": {"qq": user_id}},
-                {"type": "text", "data": {"text": "\n" + result_text}}
-            ]
-        }
-        
-        # 4. 日志与发送
+
+        # 3. 日志与发送
         await self.save_log(group_id=group_id, content=result_text, event=event)
-        await client.api.call_action("send_group_msg", **payloads)
+        await self._send_dice_result(event, result_text, target_user_id=user_id)
 
     @command_group("pc") # type: ignore
     async def pc(self, event: AstrMessageEvent):
@@ -1317,10 +1457,20 @@ class DicePlugin(Star):
     def _resolve_skill_check(self, group_id, user_id, skill_name: str, skill_value: str = None):
         skill_name = self._resolve_user_alias(str(user_id), skill_name)
         if (skill_value is None or skill_value == "") and skill_name:
-            explicit_match = re.match(r"^(.+?)(\d+)([+-]\d+)?$", skill_name.strip())
-            if explicit_match:
-                skill_name = explicit_match.group(1) + (explicit_match.group(3) or "")
-                skill_value = explicit_match.group(2)
+            s = skill_name.strip()
+            if re.search(r"[+-]\d+$", s):
+                # 形如 "侦查70+10":名+基础值+修正值,拆出基础值,修正值留给
+                # 下游 split_skill_modifier/prepare_skill_check 应用
+                mod_match = re.match(r"^(.+?)(\d+)([+-]\d+)$", s)
+                if mod_match:
+                    skill_name = mod_match.group(1) + mod_match.group(3)
+                    skill_value = mod_match.group(2)
+                # 纯修正形态("侦查+10"):整串交给下游按 卡值+修正 处理
+            else:
+                val_match = re.search(r"(\d+)$", s)
+                if val_match:
+                    skill_value = val_match.group(1)
+                    skill_name = s[: len(s) - len(val_match.group(1))].strip()
 
         lookup_name = skill_name or ""
         _, lookup_name = parse_difficulty_prefix(lookup_name)
@@ -1349,29 +1499,18 @@ class DicePlugin(Star):
         client = event.bot
         
         # 获取目标的名字
-        ret = await get_sender_nickname(client, group_id, actual_user_id)
-        if ret == "":
-            ret = event.get_sender_name() if actual_user_id == event.get_sender_id() else str(actual_user_id)
+        ret = await self._resolve_display_name(event, actual_user_id)
             
         # 如果是代投，在名字上做个小标记
         if target_user_id and target_user_id != event.get_sender_id():
-            ret = get_output("skill_check.proxy_name", name=ret, operator=event.get_sender_name())
+            ret = get_output("skill_check.proxy_name", name=ret, operator=await self._resolve_display_name(event))
 
         logger.info(ret)
         
         result_message = dice_mod.roll_attribute(roll_times, skill_name, skill_value, str(group_id), ret)
 
-        payloads = {
-            "group_id": group_id,
-            "message": [
-                {"type": "reply", "data": {"id": event.message_obj.message_id}},
-                # 依然 @ 触发指令的人，提醒他结果出来了
-                {"type": "at", "data": {"qq": event.get_sender_id()}}, 
-                {"type": "text", "data": {"text": "\n" + result_message}}
-            ]
-        }
         await self.save_log(group_id = event.get_group_id(), content = result_message, event=event)
-        await client.api.call_action("send_group_msg", **payloads)
+        await self._send_dice_result(event, result_message, target_user_id=event.get_sender_id())
 
     async def roll_attribute_until_success(self, event: AstrMessageEvent, skill_name: str = "", skill_value: str = None, target_user_id: str = None):
         group_id = event.get_group_id()
@@ -1379,23 +1518,13 @@ class DicePlugin(Star):
         skill_name, skill_value = self._resolve_skill_check(group_id, actual_user_id, skill_name, skill_value)
 
         client = event.bot
-        ret = await get_sender_nickname(client, group_id, actual_user_id)
-        if ret == "":
-            ret = event.get_sender_name() if actual_user_id == event.get_sender_id() else str(actual_user_id)
+        ret = await self._resolve_display_name(event, actual_user_id)
         if target_user_id and target_user_id != event.get_sender_id():
-            ret = get_output("skill_check.proxy_name", name=ret, operator=event.get_sender_name())
+            ret = get_output("skill_check.proxy_name", name=ret, operator=await self._resolve_display_name(event))
 
         result_message = dice_mod.roll_attribute_until_success(skill_name, skill_value, str(group_id), ret)
-        payloads = {
-            "group_id": group_id,
-            "message": [
-                {"type": "reply", "data": {"id": event.message_obj.message_id}},
-                {"type": "at", "data": {"qq": event.get_sender_id()}},
-                {"type": "text", "data": {"text": "\n" + result_message}}
-            ]
-        }
         await self.save_log(group_id=group_id, content=result_message, event=event)
-        await client.api.call_action("send_group_msg", **payloads)
+        await self._send_dice_result(event, result_message, target_user_id=event.get_sender_id())
 
     # 惩罚骰技能判定
     async def roll_attribute_penalty(self, event: AstrMessageEvent, dice_count: str = "1", skill_name: str = "", skill_value: str = None, roll_times = 1, target_user_id: str = None):
@@ -1405,26 +1534,15 @@ class DicePlugin(Star):
         skill_name, skill_value = self._resolve_skill_check(group_id, actual_user_id, skill_name, skill_value)
 
         client = event.bot
-        ret = await get_sender_nickname(client, group_id, actual_user_id)
-        if ret == "":
-            ret = event.get_sender_name() if actual_user_id == event.get_sender_id() else str(actual_user_id)
+        ret = await self._resolve_display_name(event, actual_user_id)
             
         if target_user_id and target_user_id != event.get_sender_id():
-            ret = get_output("skill_check.proxy_name", name=ret, operator=event.get_sender_name())
+            ret = get_output("skill_check.proxy_name", name=ret, operator=await self._resolve_display_name(event))
 
         result_message = dice_mod.roll_attribute_penalty(roll_times, dice_count, skill_name, skill_value, str(group_id), ret)
 
-        payloads = {
-            "group_id": group_id,
-            "message": [
-                {"type": "reply", "data": {"id": event.message_obj.message_id}},
-                {"type": "at", "data": {"qq": event.get_sender_id()}},
-                {"type": "text", "data": {"text": "\n" + result_message}}
-            ]
-        }
-
         await self.save_log(group_id = event.get_group_id(), content = result_message, event=event)
-        await client.api.call_action("send_group_msg", **payloads)
+        await self._send_dice_result(event, result_message, target_user_id=event.get_sender_id())
 
     # 奖励骰技能判定
     async def roll_attribute_bonus(self, event: AstrMessageEvent, dice_count: str = "1", skill_name: str = "", skill_value: str = None, roll_times = 1, target_user_id: str = None):
@@ -1434,48 +1552,35 @@ class DicePlugin(Star):
         skill_name, skill_value = self._resolve_skill_check(group_id, actual_user_id, skill_name, skill_value)
 
         client = event.bot
-        ret = await get_sender_nickname(client, group_id, actual_user_id)
-        if ret == "":
-            ret = event.get_sender_name() if actual_user_id == event.get_sender_id() else str(actual_user_id)
+        ret = await self._resolve_display_name(event, actual_user_id)
             
         if target_user_id and target_user_id != event.get_sender_id():
-            ret = get_output("skill_check.proxy_name", name=ret, operator=event.get_sender_name())
+            ret = get_output("skill_check.proxy_name", name=ret, operator=await self._resolve_display_name(event))
 
         result_message = dice_mod.roll_attribute_bonus(roll_times, dice_count, skill_name, skill_value, str(group_id), ret)
 
-        payloads = {
-            "group_id": group_id,
-            "message": [
-                {"type": "reply", "data": {"id": event.message_obj.message_id}},
-                {"type": "at", "data": {"qq": event.get_sender_id()}},
-                {"type": "text", "data": {"text": "\n" + result_message}}
-            ]
-        }
-
         await self.save_log(group_id = event.get_group_id(), content = result_message, event=event)
-        await client.api.call_action("send_group_msg", **payloads)
+        await self._send_dice_result(event, result_message, target_user_id=event.get_sender_id())
 
     async def roll_attribute_hidden(self, event: AstrMessageEvent, skill_name: str = "", skill_value: str = None, roll_times = 1, target_user_id: str = None):
+        if event.get_platform_name() != "aiocqhttp":
+            # 非 QQ 平台无法私聊发送结果,直接回群会泄露暗骰结果,拒绝执行
+            yield event.plain_result(get_output("dice.hidden.unsupported"))
+            return
         group_id = event.get_group_id()
         actual_user_id = target_user_id if target_user_id else event.get_sender_id()
         skill_name, skill_value = self._resolve_skill_check(group_id, actual_user_id, skill_name, skill_value)
 
         client = event.bot
-        ret = await get_sender_nickname(client, group_id, actual_user_id)
-        if ret == "":
-            ret = event.get_sender_name() if actual_user_id == event.get_sender_id() else str(actual_user_id)
+        ret = await self._resolve_display_name(event, actual_user_id)
         if target_user_id and target_user_id != event.get_sender_id():
-            ret = get_output("skill_check.proxy_name", name=ret, operator=event.get_sender_name())
+            ret = get_output("skill_check.proxy_name", name=ret, operator=await self._resolve_display_name(event))
 
         result_message = dice_mod.roll_attribute(roll_times, skill_name, skill_value, str(group_id), ret)
         await self.save_log(group_id=group_id, content="[Hidden Skill Check]" + result_message, event=event)
 
         yield event.plain_result(get_output("skill_check.hidden.sent"))
-        await client.api.call_action(
-            "send_private_msg",
-            user_id=event.get_sender_id(),
-            message=[{"type": "text", "data": {"text": result_message}}],
-        )
+        await self._send_dice_result(event, result_message, target_user_id=event.get_sender_id(), private=True)
 
     def _get_at_user_ids(self, event: AstrMessageEvent) -> list[str]:
         return [
@@ -1505,15 +1610,12 @@ class DicePlugin(Star):
 
         if spec.explicit_right:
             right_skill_name, right_value = self._resolve_skill_check(group_id, event.get_sender_id(), spec.skill_name, spec.right_value)
-            left_label = event.get_sender_name() or get_output("versus.label.left")
+            left_label = await self._resolve_display_name(event) or get_output("versus.label.left")
             right_label = get_output("versus.label.right")
         elif opponent_user_id:
             right_skill_name, right_value = self._resolve_skill_check(group_id, opponent_user_id, spec.skill_name, None)
-            left_label = event.get_sender_name() or str(event.get_sender_id())
-            try:
-                right_label = await get_sender_nickname(event.bot, group_id, opponent_user_id) or str(opponent_user_id)
-            except Exception:
-                right_label = str(opponent_user_id)
+            left_label = await self._resolve_display_name(event) or str(event.get_sender_id())
+            right_label = await self._resolve_display_name(event, opponent_user_id) or str(opponent_user_id)
         else:
             yield event.plain_result(get_output("versus.error.no_target"))
             return
@@ -1552,36 +1654,11 @@ class DicePlugin(Star):
 
         # 构造发送消息
 
-        user_name = event.get_sender_name()
+        user_name = await self._resolve_display_name(event)
         client = event.bot  # 获取机器人 Client
-        message_id = event.message_obj.message_id
-
-        payloads = {
-            "group_id": group_id,
-            "message": [
-                {
-                    "type": "reply",
-                    "data": {
-                        "id": message_id
-                    }
-                },
-                {
-                    "type": "at",
-                    "data": {
-                        "qq": user_id
-                    }
-                },
-                {
-                    "type": "text",
-                    "data": {
-                        "text": "\n" + result_str
-                    }
-                }
-            ]
-        }
 
         await self.save_log(group_id = event.get_group_id(), content = result_str, event=event)
-        await client.api.call_action("send_group_msg", **payloads)
+        await self._send_dice_result(event, result_str, target_user_id=user_id)
 
 
     # ========================================================= #
@@ -1589,6 +1666,12 @@ class DicePlugin(Star):
     # @filter.command("sc")
     async def pc_san_check(self, event: AstrMessageEvent, loss_formula: str, target_user_id: str = None):
         """理智检定"""
+        # 公式校验:裸 .sc / 乱写的公式以前会一路炸到 TypeError,这里给出用法
+        formula = str(loss_formula or "").strip()
+        if not re.fullmatch(r"\d+(?:d\d+)?(?:[+-]\d+)?(?:/\d+(?:d\d+)?(?:[+-]\d+)?)?", formula):
+            yield event.plain_result(get_output("san.usage"))
+            return
+
         user_id = target_user_id or event.get_sender_id()
         operator_user_id = str(event.get_sender_id())
         group_id = event.get_group_id()
@@ -1657,24 +1740,15 @@ class DicePlugin(Star):
                 expr = expr
             )
 
-        payloads = {
-            "group_id": group_id,
-            "message": [
-                {"type": "reply", "data": {"id": event.message_obj.message_id}},
-                {"type": "at", "data": {"qq": user_id}},
-                {"type": "text", "data": {"text": "\n" + text}}
-            ]
-        }
-        
         await self.save_log(group_id = event.get_group_id(), content = text, event=event)
-        
-        await client.api.call_action("send_group_msg", **payloads)
+
+        await self._send_dice_result(event, text, target_user_id=user_id)
 
 
     async def pc_temporary_insanity(self, event: AstrMessageEvent):
         """临时疯狂"""
         result = sanity.get_temporary_insanity(sanity.phobias, sanity.manias)
-        text = get_output("san.temporary_insanity", result=result, name=event.get_sender_name())
+        text = get_output("san.temporary_insanity", result=result, name=await self._resolve_display_name(event))
         await self.save_log(group_id = event.get_group_id(), content = text, event=event)
         yield event.plain_result(text)
 
@@ -1682,7 +1756,7 @@ class DicePlugin(Star):
     async def pc_long_term_insanity(self, event: AstrMessageEvent):
         """长期疯狂"""
         result = sanity.get_long_term_insanity(sanity.phobias, sanity.manias)
-        text = get_output("san.long_term_insanity", result=result, name=event.get_sender_name())
+        text = get_output("san.long_term_insanity", result=result, name=await self._resolve_display_name(event))
         await self.save_log(group_id = event.get_group_id(), content = text, event=event)
         yield event.plain_result(text)
 
@@ -1692,7 +1766,7 @@ class DicePlugin(Star):
         if not self._command_enabled(event):
             return
         group_id = event.get_group_id()
-        user_name = event.get_sender_name()
+        user_name = await self._resolve_display_name(event)
         if not instruction:
             yield event.plain_result(get_output("initiative.list", content=self.initiative_manager.format_list(group_id)))
         elif instruction == "clr":
@@ -1709,7 +1783,19 @@ class DicePlugin(Star):
 
         group_id = event.get_group_id()
         user_id = event.get_sender_id()
-        user_name = event.get_sender_name()
+        user_name = await self._resolve_display_name(event)
+
+        expr = (expr or "").strip()
+        # ".ri clr / .ri del 名字":空格重路由修复后到达这里,补上与 .init 一致的子指令
+        if expr in {"clr", "clear", "清空"}:
+            self.initiative_manager.clear(group_id)
+            yield event.plain_result(get_output("initiative.clear"))
+            return
+        if expr.startswith("del "):
+            player_name = expr[4:].strip() or user_name
+            self.initiative_manager.remove_by_name(group_id, player_name)
+            yield event.plain_result(get_output("initiative.remove_name", name=player_name))
+            return
 
         init_value, player_name = self.initiative_manager.parse_roll(expr, user_name)
         item = InitiativeItem(player_name, init_value, user_id)
@@ -1783,11 +1869,7 @@ class DicePlugin(Star):
             return
 
         user_id = str(event.get_sender_id())
-        nickname = event.get_sender_name()
-        try:
-            nickname = await get_sender_nickname(event.bot, group, user_id) or nickname
-        except Exception:
-            pass
+        nickname = await self._resolve_display_name(event, user_id)
         ok, info = await logger_core.toggle_observer(group, user_id, nickname)
         yield event.plain_result(info)
         
@@ -1915,8 +1997,9 @@ class DicePlugin(Star):
             return
         group = event.message_obj.group_id
         parts = event.message_str.strip().split()
-        name = parts[2] if len(parts) >= 3 else None
-        all_flag = len(parts) >= 4 and parts[3] == "--all"
+        all_flag = "--all" in parts[2:]
+        name_parts = [p for p in parts[2:] if p != "--all"]
+        name = name_parts[0] if name_parts else None
         lines = await logger_core.stat_sessions(group, name, all_flag)
         return event.plain_result("\n".join(lines))
 
@@ -1957,7 +2040,7 @@ class DicePlugin(Star):
         for target in targets:
             nickname = target
             try:
-                nickname = await get_sender_nickname(event.bot, group, target) or target
+                nickname = await self._resolve_display_name(event, target)
             except Exception:
                 pass
             ok, info = await logger_core.set_observer(group, target, nickname, session_name, enabled)
@@ -2140,7 +2223,7 @@ class DicePlugin(Star):
 
     
     # 识别所有信息
-    async def _dispatch_inline_command(self, event: AstrMessageEvent, parsed, target_user_id: str):
+    async def _dispatch_inline_command(self, event: AstrMessageEvent, parsed, target_user_id: str, raw_command: str = ""):
         cmd = parsed.cmd
         expr = parsed.expr
         remark = parsed.remark
@@ -2156,9 +2239,15 @@ class DicePlugin(Star):
             async for result in self.roll_hidden(event, expr):
                 yield result
         elif cmd == "rab":
-            await self.roll_attribute_bonus(event, dice_count, expr, skill_value, roll_times, target_user_id)
+            if not expr and not skill_value:
+                yield event.plain_result(get_output("skill_check.error.bonus"))
+            else:
+                await self.roll_attribute_bonus(event, dice_count, expr, skill_value, roll_times, target_user_id)
         elif cmd == "rap":
-            await self.roll_attribute_penalty(event, dice_count, expr, skill_value, roll_times, target_user_id)
+            if not expr and not skill_value:
+                yield event.plain_result(get_output("skill_check.error.penalty"))
+            else:
+                await self.roll_attribute_penalty(event, dice_count, expr, skill_value, roll_times, target_user_id)
         elif cmd == "rau":
             await self.roll_attribute_until_success(event, expr, skill_value, target_user_id)
         elif cmd == "ra":
@@ -2193,8 +2282,27 @@ class DicePlugin(Star):
             count = int(expr) if str(expr).isdigit() else 1
             async for result in self.generate_dnd_character(event, count):
                 yield result
+        elif cmd == "find":
+            parts = (expr or "").split()
+            spell_name = parts[0] if parts else ""
+            version_tag = parts[1] if len(parts) > 1 else ""
+            async for result in self.query_spell(event, spell_name, version_tag):
+                yield result
+        elif cmd == "nn":
+            async for result in self._handle_nn(event, raw_command):
+                yield result
+        elif cmd == "setcoc" or (cmd == "set" and str(expr or "").lower().startswith("coc")):
+            async for result in self._handle_setcoc(event, cmd, expr):
+                yield result
+        else:
+            # 指令系统家族(.log/.pc/.st/.bothelp/.bot/.alias 等)不在内联分支里,
+            # 但群聊中 "." 不在 wake_prefix 里、指令系统 handler 不会被唤醒,
+            # 直接放行只会静默——桥接到自家注册的指令 handler。
+            # 兜底提示由桥接器内部给出(它知道是否有 handler 被执行过)。
+            async for result in self._bridge_inline_to_command_system(event, raw_command):
+                yield result
 
-    async def _dispatch_private_inline_command(self, event: AstrMessageEvent, parsed):
+    async def _dispatch_private_inline_command(self, event: AstrMessageEvent, parsed, raw_command: str = ""):
         cmd = parsed.cmd
         expr = parsed.expr
         remark = parsed.remark
@@ -2212,6 +2320,9 @@ class DicePlugin(Star):
                 remark=remark,
             )
             yield event.plain_result(result)
+        elif cmd == "nn":
+            async for result in self._handle_nn(event, raw_command):
+                yield result
         elif cmd == "rh":
             yield event.plain_result(dice_mod.roll_hidden(expr))
         elif cmd in {"ra", "rc"}:
@@ -2282,8 +2393,174 @@ class DicePlugin(Star):
             count = int(expr) if str(expr).isdigit() else 1
             async for result in self.generate_dnd_character(event, count):
                 yield result
+        elif cmd == "find":
+            parts = (expr or "").split()
+            spell_name = parts[0] if parts else ""
+            version_tag = parts[1] if len(parts) > 1 else ""
+            async for result in self.query_spell(event, spell_name, version_tag):
+                yield result
+        elif cmd == "setcoc" or (cmd == "set" and str(expr or "").lower().startswith("coc")):
+            async for result in self._handle_setcoc(event, cmd, expr):
+                yield result
         else:
-            yield event.plain_result(get_output("private.unsupported"))
+            async for result in self._bridge_inline_to_command_system(
+                event, raw_command, fallback_key="private.unsupported",
+            ):
+                yield result
+
+    async def _bridge_inline_to_command_system(self, event: AstrMessageEvent, raw_command: str,
+                                               fallback_key: str = "dice.unknown_command"):
+        """把内联分发器不认识的点指令桥接回 AstrBot 指令系统。
+
+        .log/.pc/.st/.bothelp/.bot/.alias/.init/.ed/.fireball 等指令通过
+        @filter.command(_group) 注册,而 CommandFilter 只有在
+        is_at_or_wake_command 为真时才会激活(waking_check 阶段决定);
+        默认 wake_prefix 只有 "/",所以文档承诺的 "." 写法在群聊里一律静默失效,
+        私聊里也因为点号未被剥掉而匹配不上。这里模拟唤醒条件,对自家插件
+        注册的指令 filter 重放匹配,命中后直接调用对应 handler 并透传结果。
+
+        匹配顺序:先子指令 CommandFilter(如 "log new"),再指令组
+        CommandGroupFilter(裸 .log 会抛出带指令树的 ValueError,当帮助文本用)。
+        """
+        from astrbot.core.star.filter.command import CommandFilter
+        from astrbot.core.star.filter.command_group import CommandGroupFilter
+        from astrbot.core.star.star_handler import (
+            EventType,
+            star_handlers_registry,
+            star_map,
+        )
+
+        text = re.sub(r"\s+", " ", (raw_command or "").strip())
+        if not text:
+            return
+        if text == "help" or text.startswith("help "):
+            # 帮助指令的实际注册名是 bothelp
+            text = "bothelp" + text[4:]
+        m = re.match(r"^bothelp\s+(\S.*)$", text)
+        if m:
+            # 分篇帮助实际挂在 dicehelp 指令组下,兼容帮助文档宣传的
+            # ".bothelp pc" 写法(裸 bothelp 的 filter 会把参数默默丢掉)
+            text = "dicehelp " + m.group(1)
+
+        try:
+            cfg = self.context.get_config()
+        except Exception:
+            cfg = None
+
+        original_message_str = event.message_str
+        original_is_at_or_wake = getattr(event, "is_at_or_wake_command", False)
+
+        def _own_handler(handler_md):
+            md = star_map.get(handler_md.handler_module_path)
+            return md is not None and md.name == "astrbot_plugin_TRPGdice_Complete"
+
+        try:
+            event.is_at_or_wake_command = True
+            event.message_str = text
+
+            # Pass 1: 子指令/普通指令(CommandFilter)。
+            # 收集全部命中的自家 filter,按完整指令名长度降序调用:长指令优先,
+            # 避免旧的宽匹配(如 @filter.command("st"))抢在 "st show" 这类
+            # 子指令前面;某个 handler 无产出时回退到下一个候选。
+            candidates = []
+            for handler_md in star_handlers_registry.get_handlers_by_event_type(
+                EventType.AdapterMessageEvent,
+            ):
+                if not _own_handler(handler_md):
+                    continue
+                for filter_obj in handler_md.event_filters:
+                    if not isinstance(filter_obj, CommandFilter):
+                        continue
+                    try:
+                        matched = filter_obj.filter(event, cfg)
+                    except Exception:
+                        continue
+                    if not matched:
+                        continue
+                    params = event.get_extra("parsed_params") or {}
+                    if isinstance(event._extras, dict):
+                        event._extras.pop("parsed_params", None)
+                    try:
+                        full_name = filter_obj.get_complete_command_names()[0]
+                    except Exception:
+                        full_name = ""
+                    candidates.append((len(full_name), handler_md, params))
+                    break
+
+            candidates.sort(key=lambda item: item[0], reverse=True)
+
+            called_any = False
+            for _, handler_md, params in candidates:
+                called_any = True
+                produced = False
+                try:
+                    call_result = handler_md.handler(event, **params)
+                    if inspect.isasyncgen(call_result):
+                        async for result in call_result:
+                            produced = True
+                            yield result
+                    else:
+                        # 子指令 handler 多为普通协程,结果通过 return 返回
+                        result = await call_result
+                        if result is None:
+                            pass
+                        elif isinstance(result, str):
+                            produced = True
+                            yield event.plain_result(result)
+                        elif getattr(result, "chain", None) is not None:
+                            produced = True
+                            yield result
+                except Exception as e:
+                    logger.error(f"[bridge] handler {handler_md.handler_name} 执行失败: {e}")
+                    continue
+                if produced:
+                    return
+            if called_any:
+                # 有 handler 被执行但无产出(如 .fire 用 event.send 直发、
+                # .bot off 后被门禁静默):不能再追加"没听懂"兜底
+                return
+
+            # Pass 2: 指令组(裸 .log/.pc 会抛出带指令树的 ValueError,当帮助文本用)
+            for handler_md in star_handlers_registry.get_handlers_by_event_type(
+                EventType.AdapterMessageEvent,
+            ):
+                if not _own_handler(handler_md):
+                    continue
+                for filter_obj in handler_md.event_filters:
+                    if not isinstance(filter_obj, CommandGroupFilter):
+                        continue
+                    try:
+                        matched = filter_obj.filter(event, cfg)
+                    except ValueError as e:
+                        yield event.plain_result(str(e))
+                        return
+                    except Exception:
+                        continue
+                    if not matched:
+                        continue
+                    params = event.get_extra("parsed_params") or {}
+                    if isinstance(event._extras, dict):
+                        event._extras.pop("parsed_params", None)
+                    call_result = handler_md.handler(event, **params)
+                    if inspect.isasyncgen(call_result):
+                        async for result in call_result:
+                            yield result
+                    else:
+                        result = await call_result
+                        if result is None:
+                            pass
+                        elif isinstance(result, str):
+                            yield event.plain_result(result)
+                        elif getattr(result, "chain", None) is not None:
+                            yield result
+                    return
+            # 没有任何自家指令接住这个点指令(且无 handler 被执行):兜底提示。
+            # 注意:called_any 时上面已 return——send 型指令(.fire)和被门禁静默的
+            # 指令都到达过 handler,不能再追加"没听懂"。
+            yield event.plain_result(get_output(fallback_key))
+        finally:
+            event.message_str = original_message_str
+            event.is_at_or_wake_command = original_is_at_or_wake
 
     async def _record_group_message(self, event: AstrMessageEvent, message: str):
         group_id = event.message_obj.group_id
@@ -2315,25 +2592,30 @@ class DicePlugin(Star):
 
         # yield event.plain_result(message)
 
-        random.seed(int(time.time() * 1000))
-
         command_text = strip_command_prefix(message, self.wakeup_prefix)
         if command_text is None:
             return
 
-        parsed = parse_inline_command(command_text)
+        # 保留未破坏空白信息的原始指令体（strip_command_prefix 会把所有空白剥掉，
+        # 而桥接到指令系统时需要 "log new xxx" 这样的原始分词）
+        raw_command = message[1:].strip()
+
+        parsed = self._maybe_reroute_with_spaces(parse_inline_command(command_text), raw_command)
         if parsed is None:
             return
 
-        async for result in self._dispatch_inline_command(event, parsed, target_user_id):
+        # .bot off 门禁:只拦内联骰系;指令系统家族(log/pc/st)不受影响,
+        # .bot(无内联注册)永远可用来重新开机
+        if parsed.cmd in self._INLINE_CMDS and not self._command_enabled(event):
+            return
+
+        async for result in self._dispatch_inline_command(event, parsed, target_user_id, raw_command):
             yield result
         return
 
     @event_message_type(EventMessageType.PRIVATE_MESSAGE)
     async def identify_private_command(self, event: AstrMessageEvent):
         message = event.message_obj.message_str
-
-        random.seed(int(time.time() * 1000))
 
         command_text = strip_command_prefix(message, self.wakeup_prefix)
         if command_text is None:
@@ -2343,11 +2625,13 @@ class DicePlugin(Star):
             self._stop_event(event)
             return
 
-        parsed = parse_inline_command(command_text)
+        raw_command = message[1:].strip()
+
+        parsed = self._maybe_reroute_with_spaces(parse_inline_command(command_text), raw_command)
         if parsed is None:
             return
 
-        async for result in self._dispatch_private_inline_command(event, parsed):
+        async for result in self._dispatch_private_inline_command(event, parsed, raw_command):
             yield result
         return
 

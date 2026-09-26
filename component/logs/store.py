@@ -446,15 +446,6 @@ class JSONLoggerCore:
         return True, get_output("log.session_halted", session_name=name)
 
     async def list_sessions(self, group_id: str) -> List[str]:
-        
-        if group_id == "1062260572" :
-            lines = []
-            name = "746573746c6f67"
-            st = "0"
-            status = get_output("log.status_finished")
-            lines.append(get_output("log.session_line", session_name=name, start_time=st, status=status, message_count=-222))
-            return lines
-        
         grp = await self.load_group(group_id)
         lines = []
         for session_uuid, sec in grp.items():
@@ -491,6 +482,11 @@ class JSONLoggerCore:
             os.remove(os.path.join(self.base_dir, "exports", f"{group_id}_{self._session_name(session_uuid, sec)}.json"))
         except Exception:
             pass
+        try:
+            # export text 生成的 <uuid>.txt 也要一并清掉,否则留残留文件
+            os.remove(os.path.join(self.base_dir, "exports", f"{session_uuid}.txt"))
+        except Exception:
+            pass
         del grp[session_uuid]
         await self.persist_group(group_id)
         return True, get_output("log.session_deleted", session_name=self._session_name(session_uuid, sec))
@@ -500,13 +496,6 @@ class JSONLoggerCore:
         return self._resolve_session(grp, name_or_uuid)
 
     async def export_session(self, group_id: str, sec: dict, name: str) -> str:
-
-        if group_id == "1062260572" and name == "746573746c6f67":
-            website = get_output("setting.website")
-            file_name = "74657374"
-            result_website = f"{website}/?uuid={file_name}"
-            return get_output("log.session_exported", session_name = "???", file_name=file_name, result_website = result_website)
-        
         raw_session_uuid = str(sec.get("uuid") or "")
         session_uuid = raw_session_uuid.lower() if self._is_log_uuid(raw_session_uuid) else uuid.uuid4().hex[:8]
         session_name = str(sec.get("name") or name or session_uuid)
