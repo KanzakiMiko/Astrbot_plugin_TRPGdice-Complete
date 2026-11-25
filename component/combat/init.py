@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from ..common.output import get_output
+from ..roll.dice import parse_dice_expression
 
 
 @dataclass
@@ -92,27 +93,43 @@ class InitiativeManager:
         return "\n".join(lines)
 
     def parse_roll(self, expr: Optional[str], default_name: str) -> Tuple[int, str]:
+        """解析 .ri 参数,返回 (先攻值, 名字)。
+
+        表达式部分与 .rd 一致,其后的文字作为独立单位的名字(DM 可为不同怪物分别掷):
+          空 / +2 / +5+d4 / d20+3 / 2d6 / 20+5+d4(开头数字=骰面,同 .rd20) / 14(仅数字=固定值)
+        """
+        expr = (expr or "").strip()
         if not expr:
             return random.randint(1, 20), default_name
 
-        # 骰式先攻(".ri 1d20"/".ri 2d6+3"):文档承诺的形态,此前被当成"值1名字d20"
-        dice_match = re.match(r"^(\d*)d(\d+)([+-]\d+)?$", expr.strip(), re.IGNORECASE)
-        if dice_match:
-            count = int(dice_match.group(1) or 1)
-            faces = int(dice_match.group(2))
-            modifier = int(dice_match.group(3) or 0)
-            init_value = sum(random.randint(1, faces) for _ in range(count)) + modifier
-            return init_value, default_name
+        dice = r"\d*d\d+"
+        chain = r"(?:[+\-*/](?:" + dice + r"|\d+))"
 
-        if expr[0] == "+":
-            match = re.match(r"\+(\d+)", expr)
-            return random.randint(1, 20) + int(match.group(1)), default_name
+        def evaluate(dice_expr: str, name: str) -> Optional[Tuple[int, str]]:
+            total, _ = parse_dice_expression(dice_expr)
+            if total is None:
+                return None
+            return int(total), name.strip() or default_name
 
-        if expr[0] == "-":
-            match = re.match(r"\-(\d+)", expr)
-            return random.randint(1, 20) - int(match.group(1)), default_name
+        # 只有修正项(".ri+2 名字" / ".ri+5+d4 名字"):1d20 + 修正
+        m = re.match(r"^((?:[+\-](?:" + dice + r"|\d+))+)\s*(.*)$", expr, re.IGNORECASE | re.DOTALL)
+        if m and (r := evaluate("1d20" + m.group(1), m.group(2))):
+            return r
 
-        match = re.match(r"(\d+)", expr)
-        init_value = int(match.group(1))
-        player_name = expr[match.end():] or default_name
-        return init_value, player_name
+        # 骰式开头(".ri d20+3 名字" / ".ri 2d6 头目")
+        m = re.match(r"^(" + dice + r")(" + chain + r"*)\s*(.*)$", expr, re.IGNORECASE | re.DOTALL)
+        if m and (r := evaluate(m.group(1) + m.group(2), m.group(3))):
+            return r
+
+        # 数字后带修正(".ri20+5+d4 名字"):数字当骰面,和 .rd20 一致
+        m = re.match(r"^(\d+)(" + chain + r"+)\s*(.*)$", expr, re.IGNORECASE | re.DOTALL)
+        if m and (r := evaluate("1d" + m.group(1) + m.group(2), m.group(3))):
+            return r
+
+        # 纯数字 = 固定先攻值(".ri 14 名字")
+        m = re.match(r"^(\d+)\s*(.*)$", expr, re.DOTALL)
+        if m:
+            return int(m.group(1)), m.group(2).strip() or default_name
+
+        # 只写了名字(".ri 枯刃藤怪"):d20 先攻
+        return random.randint(1, 20), expr

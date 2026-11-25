@@ -39,13 +39,19 @@ def _format_number(value):
     return str(round(value, 2)) if isinstance(value, float) else str(value)
 
 def _roll_dice_term(expr, bonus_dice=0, penalty_dice=0):
-    match = re.fullmatch(r"(\d*)d(\d+)(k-?\d+)?(v(\d+)?)?", expr, re.IGNORECASE)
+    match = re.fullmatch(r"(\d*)d(\d+)(k[hl]?-?\d+)?(v(\d+)?)?", expr, re.IGNORECASE)
     if not match:
         return None, get_output("dice.expression.format_error", expr=expr), False
 
     dice_count = int(match.group(1)) if match.group(1) else 1
     dice_faces = int(match.group(2))
-    keep_count = int(match.group(3)[1:]) if match.group(3) else dice_count
+    keep_count = dice_count
+    if match.group(3):
+        # k N / k-N(兼容旧写法,负数=取最低) / kh N 取最高 / kl N 取最低
+        keep_match = re.fullmatch(r"k([hl]?)(-?\d+)", match.group(3), re.IGNORECASE)
+        keep_mode = keep_match.group(1).lower()
+        keep_n = int(keep_match.group(2))
+        keep_count = -abs(keep_n) if keep_mode == "l" else (abs(keep_n) if keep_mode == "h" else keep_n)
     vampire_difficulty = (int(match.group(5)) if match.group(5) and match.group(5).strip() != "v" else 6) if match.group(4) else None
 
     if not (1 <= dice_count <= 100 and 1 <= dice_faces <= 1000):
@@ -102,7 +108,8 @@ def _roll_dice_term(expr, bonus_dice=0, penalty_dice=0):
 
     if keep_amount < dice_count:
         dropped = " ".join(map(str, sorted_rolls[keep_amount:]))
-        detail = f"[{' + '.join(map(str, selected_rolls))} | 丢弃: {dropped}]"
+        kept_label = "取低" if keep_lowest else "取高"
+        detail = f"[{kept_label} {' + '.join(map(str, selected_rolls))} | 丢弃: {dropped}]"
 
     return subtotal, detail, False
 
@@ -121,7 +128,7 @@ def _tokenize_dice_expression(expression, bonus_dice=0, penalty_dice=0):
             i += 1
             continue
 
-        dice_match = re.match(r"(\d*)d(\d+)(k-?\d+)?(v(\d+)?)?", expression[i:], re.IGNORECASE)
+        dice_match = re.match(r"(\d*)d(\d+)(k[hl]?-?\d+)?(v(\d+)?)?", expression[i:], re.IGNORECASE)
         if dice_match and dice_match.group(0):
             dice_expr = dice_match.group(0)
             value, detail, is_vampire_roll = _roll_dice_term(dice_expr, bonus_dice, penalty_dice)
@@ -225,6 +232,14 @@ def parse_dice_expression(expression):
     返回 (总和, 格式化字符串)
     """
     expression_original = expression # 保留原始表达式用于显示
+    # 优势/劣势:2d20 取高/取低一颗,可接修正值(adv+5 / 优势+5)
+    def _adv_dis(kind):
+        def repl(m):
+            faces = m.group("f1") or m.group("f2") or "20"
+            return f"2d{faces}k{kind}1"
+        return repl
+    expression = re.sub(r"(?<![A-Za-z])d?adv(?:d(?P<f1>\d+))?(?![A-Za-z])|d?优势(?:d(?P<f2>\d+))?", _adv_dis("h"), expression, flags=re.IGNORECASE)
+    expression = re.sub(r"(?<![A-Za-z])d?dis(?:d(?P<f1>\d+))?(?![A-Za-z])|d?劣势(?:d(?P<f2>\d+))?", _adv_dis("l"), expression, flags=re.IGNORECASE)
     expression = expression.replace("x", "*").replace("X", "*")
 
     match_repeat = re.match(r"(\d+)?#(.+)", expression)

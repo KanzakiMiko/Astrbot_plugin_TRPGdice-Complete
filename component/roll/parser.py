@@ -103,6 +103,31 @@ def _parse_check_command(message: str, prefix: str) -> ParsedInlineCommand:
     )
 
 
+_ADV_TERM = r"[+\-*/](?:\d*d\d+|\d+)"
+
+
+def _parse_adv_expr(raw: str):
+    """优势/劣势写法 -> (表达式, 备注);不是优势写法返回 None。
+
+    支持 adv/dis/优势/劣势,可带重复次数前缀和可选的 d:
+    "优势+6"、"d优势+6"、"3#d优势+6"、"劣势d12-1"、"3#adv+2"。
+    """
+    m = re.match(
+        r"(?:(?P<n>\d+)#)?d?"
+        r"(?:(?P<a>adv|dis)(?:d(?P<f1>\d+))?(?![A-Za-z])|(?P<c>优势|劣势)(?:d(?P<f2>\d+))?)"
+        r"(?P<mod>(?:" + _ADV_TERM + r")*)",
+        raw,
+        re.IGNORECASE,
+    )
+    if not m:
+        return None
+    is_adv = (m.group("a") or "").lower() == "adv" or m.group("c") == "优势"
+    faces = m.group("f1") or m.group("f2") or "20"
+    prefix = f"{m.group('n')}#" if m.group("n") else ""
+    expr = f"{prefix}2d{faces}k{'h' if is_adv else 'l'}1{m.group('mod')}"
+    return expr, (raw[m.end():].strip() or None)
+
+
 def parse_inline_command(message: str) -> Optional[ParsedInlineCommand]:
     """Parse dot-style inline commands handled by identify_command."""
     m = re.match(r"^([a-z]+)", message, re.I)
@@ -125,6 +150,10 @@ def parse_inline_command(message: str) -> Optional[ParsedInlineCommand]:
             skill_value = None
             expr = message[2:]
         cmd = "en"
+
+    # ".r adv" 粘连成 "radv"(会被当成 ra 技能检定)、".r 优势" 成 "r优势":改写成 rd 再解析
+    if re.match(r"^r(?:adv|dis)(?:d\d+)?(?![a-z])", message, re.I) or re.match(r"^r(?:优势|劣势)", message):
+        return parse_inline_command("rd" + message[1:])
 
     if cmd == "rau":
         return _parse_check_command(message, "rau")
@@ -151,19 +180,47 @@ def parse_inline_command(message: str) -> Optional[ParsedInlineCommand]:
         raw = message[2:].strip()
         # 完整骰式(".rd 1d100 试骰" 粘连成 "rd1d100试骰"):先吃整个 XdY,
         # 否则旧逻辑会把 "1d100" 拆成骰面 1 + 备注 "d100试骰",变成掷 1d1
-        expr_match = re.match(r"(\d*d\d+)", raw, re.IGNORECASE)
+        term = r"[+\-*/](?:\d*d\d+|\d+)"
+        mod_re = r"((?:" + term + r")*)"
+        adv_parsed = _parse_adv_expr(raw)
+        if adv_parsed:
+            return ParsedInlineCommand(
+                cmd="rd", expr=adv_parsed[0], remark=adv_parsed[1], skill_value=skill_value,
+                dice_count=dice_count, roll_times=roll_times,
+            )
+        adv_match = re.match(
+            r"(?:(?P<a>adv|dis)(?:d(?P<f1>\d+))?(?![A-Za-z])|(?P<c>优势|劣势)(?:d(?P<f2>\d+))?)"
+            r"(?P<mod>(?:" + term + r")*)",
+            raw,
+            re.IGNORECASE,
+        )
+        if adv_match:
+            is_adv = (adv_match.group("a") or "").lower() == "adv" or adv_match.group("c") == "优势"
+            faces = adv_match.group("f1") or adv_match.group("f2") or "20"
+            expr = f"2d{faces}k{'h' if is_adv else 'l'}1{adv_match.group('mod')}"
+            remark = raw[adv_match.end():].strip() or None
+            cmd = "rd"
+            return ParsedInlineCommand(
+                cmd=cmd, expr=expr, remark=remark, skill_value=skill_value,
+                dice_count=dice_count, roll_times=roll_times,
+            )
+        expr_match = re.match(r"(\d*d\d+)" + mod_re, raw, re.IGNORECASE)
         if expr_match:
-            expr = expr_match.group(1)
+            expr = expr_match.group(0)
             remark = raw[len(expr):].strip() or None
         else:
-            dice_match = re.match(r"(\d+)", raw)
+            dice_match = re.match(r"(\d+)" + mod_re, raw, re.IGNORECASE)
             if dice_match:
-                dice_size = dice_match.group(1)
-                expr = f"1d{dice_size}"
-                remark = raw[len(dice_size):].strip()
+                expr = f"1d{dice_match.group(1)}{dice_match.group(2)}"
+                remark = raw[dice_match.end():].strip()
             else:
-                expr = "1d100"
-                remark = raw.strip()
+                mod_match = re.match(r"((?:" + term + r")+)", raw, re.IGNORECASE)
+                if mod_match:
+                    expr = "1d100" + mod_match.group(1)
+                    remark = raw[mod_match.end():].strip()
+                else:
+                    expr = "1d100"
+                    remark = raw.strip()
         cmd = "rd"
 
     elif cmd[0] == "r" and cmd != "rv":
@@ -174,6 +231,9 @@ def parse_inline_command(message: str) -> Optional[ParsedInlineCommand]:
         if not content:
             expr = "1d100"
             remark = ""
+        elif _parse_adv_expr(content):
+            expr, remark = _parse_adv_expr(content)
+            remark = remark or ""
         else:
             match = re.match(r"([\d#+\-*/().xXdkvbpBP]+)", content, re.IGNORECASE)
             if match:
